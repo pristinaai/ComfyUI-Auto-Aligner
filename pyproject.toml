@@ -1,0 +1,15 @@
+[project]
+name = "auto-aligner"
+version = "1.0.0"
+description = "Align a source image onto a destination image. Outputs the aligned image and a mask at the destination resolution."
+requires-python = ">=3.9"
+dependencies = ["numpy", "opencv-python"]
+classifiers = ["Operating System :: OS Independent"]
+
+[project.urls]
+Repository = "https://github.com/pristinaai/ComfyUI-Auto-Aligner"
+"Bug Tracker" = "https://github.com/pristinaai/ComfyUI-Auto-Aligner/issues"
+
+[tool.comfy]
+PublisherId = "pristinaai"
+DisplayName = "Auto Aligner"

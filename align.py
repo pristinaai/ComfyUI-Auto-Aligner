@@ -1,0 +1,647 @@
+"""Align a source image onto a destination image.
+
+Feature detection uses OpenCV SIFT. The fit, puppet warp, colour match, and
+auto mask follow the same steps as the browser tool.
+"""
+
+import math
+
+import cv2
+import numpy as np
+
+MIN_INLIERS = 8
+THRESH_FRAC = 0.015
+TIGHT_PX = 1.0
+RATIO = 0.8
+FAST = {
+    "max_edge": 1600,
+    "max_keypoints": 4000,
+    "contrast": 0.015,
+    "fusion": False,
+    "iters": 500,
+}
+HIGH = {
+    "max_edge": 3200,
+    "max_keypoints": 16000,
+    "contrast": 0.015,
+    "fusion": False,
+    "iters": 10000,
+}
+FUSED = {
+    "max_edge": 3200,
+    "max_keypoints": 16000,
+    "contrast": 0.006,
+    "fusion": True,
+    "iters": 10000,
+}
+DEFAULT_WARP_GRID = 12
+BASE_LAMBDA = 1e3
+
+
+def align_pair(source_u8, dest_u8, options):
+    """Return float RGB (H, W, 3) and alpha (H, W) at the destination size."""
+    height, width = dest_u8.shape[:2]
+    order = (HIGH, FUSED, FAST) if options.get("features", "high") == "high" else (FAST, HIGH, FUSED)
+    pass_result = None
+    for budget in order:
+        pass_result = _fit_pass(source_u8, dest_u8, options, budget)
+        if pass_result is not None:
+            break
+        print(
+            f"Auto Aligner: {budget['max_keypoints']} features was not enough, trying the other pass"
+        )
+    if pass_result is None:
+        raise RuntimeError("Too few inliers. Try images with more overlap.")
+
+    sim, inliers, stats = pass_result
+    tps = None
+    cells = 64
+    if options["puppet_warp"]:
+        tps = _fit_tps(inliers, sim, options["warp_grid"])
+        cells = min(160, max(64, int(options["warp_grid"]) * 5))
+
+    rgb, alpha = _render(source_u8, width, height, sim, tps, cells)
+    if options["harmonize"] > 0:
+        rgb = _harmonize(rgb, alpha, dest_u8, options["harmonize"])
+    if options["auto_mask"]:
+        alpha = alpha * _difference_mask(rgb, alpha, dest_u8, options["mask_sensitivity"])
+    print(
+        f"Auto Aligner: source {stats[0]} pts, destination {stats[1]} pts, "
+        f"{stats[2]} matches, {stats[3]} inliers"
+    )
+    return rgb, alpha.astype(np.float32)
+
+
+def _fit_pass(source_u8, dest_u8, options, budget):
+    feat_a = _extract(source_u8, budget)
+    feat_b = _extract(dest_u8, budget)
+    if feat_a is None or feat_b is None:
+        return None
+    pts_a, desc_a = feat_a
+    pts_b, desc_b = feat_b
+    matches = _match(pts_a, desc_a, pts_b, desc_b)
+    if len(matches) < MIN_INLIERS:
+        return None
+    fit = _ransac(
+        matches,
+        options,
+        source_u8.shape[1],
+        source_u8.shape[0],
+        dest_u8.shape[1],
+        dest_u8.shape[0],
+        budget["iters"],
+    )
+    if fit is None:
+        return None
+    sim, inliers = fit
+    return sim, inliers, (len(pts_a), len(pts_b), len(matches), len(inliers))
+
+
+def _detect(rgb, nfeatures, contrast):
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    sift = cv2.SIFT_create(
+        nfeatures=int(nfeatures),
+        nOctaveLayers=3,
+        contrastThreshold=float(contrast),
+        edgeThreshold=10,
+        sigma=1.6,
+    )
+    keypoints, desc = sift.detectAndCompute(gray, None)
+    if desc is None or len(keypoints) == 0:
+        return None
+    pts = np.array([kp.pt for kp in keypoints], np.float64)
+    response = np.array([kp.response for kp in keypoints], np.float32)
+    desc = desc.astype(np.float32)
+    desc /= np.maximum(np.linalg.norm(desc, axis=1, keepdims=True), 1e-8)
+    return pts, desc, response
+
+
+def _spatial_cap(pts, desc, response, limit, width, height):
+    if len(pts) <= limit:
+        return pts, desc
+    cells = 24
+    cx = np.clip(np.floor(pts[:, 0] / max(width, 1) * cells), 0, cells - 1).astype(np.int32)
+    cy = np.clip(np.floor(pts[:, 1] / max(height, 1) * cells), 0, cells - 1).astype(np.int32)
+    buckets = [[] for _ in range(cells * cells)]
+    for idx in np.argsort(-response):
+        buckets[int(cy[idx]) * cells + int(cx[idx])].append(int(idx))
+    kept = []
+    round_i = 0
+    while len(kept) < limit:
+        added = 0
+        for bucket in buckets:
+            if round_i < len(bucket):
+                kept.append(bucket[round_i])
+                added += 1
+                if len(kept) >= limit:
+                    break
+        if added == 0:
+            break
+        round_i += 1
+    kept = np.array(kept, np.int32)
+    return pts[kept], desc[kept]
+
+
+def _extract(rgb, budget):
+    height, width = rgb.shape[:2]
+    scale = min(1.0, budget["max_edge"] / max(height, width))
+    work_w = max(32, int(round(width * scale)))
+    work_h = max(32, int(round(height * scale)))
+    work = cv2.resize(rgb, (work_w, work_h), interpolation=cv2.INTER_AREA)
+    limit = budget["max_keypoints"]
+    primary_n = int(limit * 0.88) if budget["fusion"] else limit
+    found = _detect(work, max(primary_n, 8), budget["contrast"])
+    if found is None:
+        return None
+    pts, desc, response = found
+    pts = _to_original(pts, work_w, work_h, width, height)
+    if budget["fusion"] and min(work_w, work_h) >= 512:
+        half_w = max(32, work_w // 2)
+        half_h = max(32, work_h // 2)
+        half = cv2.resize(work, (half_w, half_h), interpolation=cv2.INTER_AREA)
+        sec_n = max(256, min(2048, int(limit * 0.25)))
+        second = _detect(half, sec_n, budget["contrast"])
+        if second is not None:
+            pts2, desc2, response2 = second
+            pts2 = _to_original(pts2, half_w, half_h, width, height)
+            pts = np.concatenate([pts, pts2], axis=0)
+            desc = np.concatenate([desc, desc2], axis=0)
+            response = np.concatenate([response, response2], axis=0)
+    if len(pts) < 8:
+        return None
+    pts, desc = _spatial_cap(pts, desc, response, limit, width, height)
+    if len(pts) < 8:
+        return None
+    return pts, desc
+
+
+def _to_original(pts, work_w, work_h, width, height):
+    """Map work-image pixel centers back to the original image."""
+    out = pts.copy()
+    out[:, 0] = (pts[:, 0] + 0.5) * (width / work_w) - 0.5
+    out[:, 1] = (pts[:, 1] + 0.5) * (height / work_h) - 0.5
+    return out
+
+
+def _match(pts_a, desc_a, pts_b, desc_b):
+    """Exact nearest neighbours. Ratio test is one way, then a mutual check."""
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    forward = matcher.knnMatch(desc_a, desc_b, k=2)
+    backward = matcher.knnMatch(desc_b, desc_a, k=2)
+    back = {}
+    for pair in backward:
+        if pair:
+            back[pair[0].queryIdx] = pair[0].trainIdx
+    pairs = []
+    for pair in forward:
+        if len(pair) < 2:
+            continue
+        best, second = pair
+        if second.distance <= 0 or best.distance >= RATIO * second.distance:
+            continue
+        i = best.queryIdx
+        j = best.trainIdx
+        if back.get(j) != i:
+            continue
+        pairs.append((pts_a[i, 0], pts_a[i, 1], pts_b[j, 0], pts_b[j, 1]))
+    return pairs
+
+
+def _apply(sim, x, y):
+    s, c, si, tx, ty = sim
+    return s * (c * x - si * y) + tx, s * (si * x + c * y) + ty
+
+
+def _invert(sim):
+    s, c, si, tx, ty = sim
+    inv_s = 1.0 / (s or 1.0)
+    nsi = -si
+    return (
+        inv_s,
+        c,
+        nsi,
+        -inv_s * (c * tx - nsi * ty),
+        -inv_s * (nsi * tx + c * ty),
+    )
+
+
+def _apply_inv(sim, x, y):
+    return _apply(_invert(sim), x, y)
+
+
+def _fit_similarity(src, dst, options, width_a, height_a, width_b, height_b):
+    count = len(src)
+    if count <= 0:
+        return None
+    mu_a = src.mean(axis=0)
+    mu_b = dst.mean(axis=0)
+    a = src - mu_a
+    b = dst - mu_b
+    sxx = float(np.sum(b[:, 0] * a[:, 0]))
+    sxy = float(np.sum(b[:, 0] * a[:, 1]))
+    syx = float(np.sum(b[:, 1] * a[:, 0]))
+    syy = float(np.sum(b[:, 1] * a[:, 1]))
+    var_a = float(np.sum(a * a))
+    dot = float(np.sum(a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1]))
+    c, si = 1.0, 0.0
+    if options["rotate"]:
+        angle = math.atan2(syx - sxy, sxx + syy)
+        c, si = math.cos(angle), math.sin(angle)
+        if (sxx * syy - sxy * syx) < 0 and abs(sxx + syy) < 1e-12:
+            c = -c
+    scale = 1.0
+    if options["resize"]:
+        if var_a < 1e-12:
+            return None
+        if options["rotate"]:
+            rx = c * a[:, 0] - si * a[:, 1]
+            ry = si * a[:, 0] + c * a[:, 1]
+            scale = float(np.sum(rx * b[:, 0] + ry * b[:, 1]) / var_a)
+        else:
+            scale = dot / var_a
+        if not math.isfinite(scale) or scale <= 1e-6:
+            return None
+    if options["position"]:
+        tx = mu_b[0] - scale * (c * mu_a[0] - si * mu_a[1])
+        ty = mu_b[1] - scale * (si * mu_a[0] + c * mu_a[1])
+    else:
+        cx_a, cy_a = width_a * 0.5, height_a * 0.5
+        cx_b, cy_b = width_b * 0.5, height_b * 0.5
+        tx = cx_b - scale * (c * cx_a - si * cy_a)
+        ty = cy_b - scale * (si * cx_a + c * cy_a)
+    sim = (scale, c, si, float(tx), float(ty))
+    if not all(math.isfinite(v) for v in sim):
+        return None
+    return sim
+
+
+def _inliers(pairs, sim, thresh):
+    src = np.array([(p[0], p[1]) for p in pairs], np.float64)
+    dst = np.array([(p[2], p[3]) for p in pairs], np.float64)
+    mx, my = _apply(sim, src[:, 0], src[:, 1])
+    keep = (mx - dst[:, 0]) ** 2 + (my - dst[:, 1]) ** 2 <= thresh * thresh
+    return src[keep], dst[keep]
+
+
+def _magsac(pairs, options, width_a, height_a, width_b, height_b):
+    src = np.float32([(p[0], p[1]) for p in pairs])
+    dst = np.float32([(p[2], p[3]) for p in pairs])
+    thresh = THRESH_FRAC * math.hypot(width_b, height_b)
+    affine, mask = cv2.estimateAffinePartial2D(
+        src,
+        dst,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=float(thresh),
+        maxIters=10000,
+        confidence=0.999,
+        refineIters=50,
+    )
+    if affine is None or mask is None:
+        return None
+    keep = mask.ravel().astype(bool)
+    if int(keep.sum()) < MIN_INLIERS:
+        return None
+    sim = _fit_similarity(
+        src[keep].astype(np.float64),
+        dst[keep].astype(np.float64),
+        options,
+        width_a,
+        height_a,
+        width_b,
+        height_b,
+    )
+    if sim is None:
+        return None
+    inl_src, inl_dst = _inliers(pairs, sim, thresh)
+    if len(inl_src) >= MIN_INLIERS:
+        final = _fit_similarity(inl_src, inl_dst, options, width_a, height_a, width_b, height_b)
+        if final is not None:
+            sim = final
+        used_src, used_dst = inl_src, inl_dst
+    else:
+        used_src = src[keep].astype(np.float64)
+        used_dst = dst[keep].astype(np.float64)
+    sim, used_src, used_dst = _tighten(used_src, used_dst, sim, options, width_a, height_a, width_b, height_b)
+    return sim, np.concatenate([used_src, used_dst], axis=1)
+
+
+def _ransac(pairs, options, width_a, height_a, width_b, height_b, iterations):
+    if len(pairs) < 2:
+        return None
+    if options["resize"] and options["rotate"] and options["position"]:
+        fitted = _magsac(pairs, options, width_a, height_a, width_b, height_b)
+        if fitted is not None:
+            return fitted
+    thresh = THRESH_FRAC * math.hypot(width_b, height_b)
+    iterations = max(iterations, 8000)
+    rng = np.random.default_rng()
+    best_src = None
+    best_dst = None
+    n = len(pairs)
+    for _ in range(iterations):
+        i0 = int(rng.integers(0, n))
+        i1 = int(rng.integers(0, n - 1))
+        if i1 >= i0:
+            i1 += 1
+        sample = [pairs[i0], pairs[i1]]
+        src = np.array([[sample[0][0], sample[0][1]], [sample[1][0], sample[1][1]]], np.float64)
+        dst = np.array([[sample[0][2], sample[0][3]], [sample[1][2], sample[1][3]]], np.float64)
+        model = _fit_similarity(src, dst, options, width_a, height_a, width_b, height_b)
+        if model is None:
+            continue
+        inl_src, inl_dst = _inliers(pairs, model, thresh)
+        if best_src is None or len(inl_src) > len(best_src):
+            best_src, best_dst = inl_src, inl_dst
+    if best_src is None or len(best_src) < MIN_INLIERS:
+        return None
+    sim = _fit_similarity(best_src, best_dst, options, width_a, height_a, width_b, height_b)
+    if sim is None:
+        return None
+    refined_src, refined_dst = _inliers(pairs, sim, thresh)
+    if len(refined_src) >= MIN_INLIERS:
+        final = _fit_similarity(refined_src, refined_dst, options, width_a, height_a, width_b, height_b)
+        if final is not None:
+            sim = final
+            best_src, best_dst = refined_src, refined_dst
+    sim, best_src, best_dst = _tighten(
+        best_src, best_dst, sim, options, width_a, height_a, width_b, height_b
+    )
+    packed = np.concatenate([best_src, best_dst], axis=1).astype(np.float64)
+    return sim, packed
+
+
+def _tighten(src, dst, sim, options, width_a, height_a, width_b, height_b):
+    """Refit on matches that already agree to about one pixel."""
+    mx, my = _apply(sim, src[:, 0], src[:, 1])
+    keep = (mx - dst[:, 0]) ** 2 + (my - dst[:, 1]) ** 2 <= TIGHT_PX * TIGHT_PX
+    if int(keep.sum()) < MIN_INLIERS:
+        return sim, src, dst
+    final = _fit_similarity(src[keep], dst[keep], options, width_a, height_a, width_b, height_b)
+    if final is None:
+        return sim, src, dst
+    return final, src[keep], dst[keep]
+
+
+def _u(r2):
+    out = np.zeros_like(r2)
+    ok = r2 >= 1e-12
+    out[ok] = r2[ok] * np.log(r2[ok])
+    return out
+
+
+def _fit_tps(inliers, sim, warp_grid):
+    count = len(inliers)
+    cells = max(2, int(round(warp_grid)))
+    xs = inliers[:, 2]
+    ys = inliers[:, 3]
+    span_x = max(1e-6, float(xs.max() - xs.min()))
+    span_y = max(1e-6, float(ys.max() - ys.min()))
+    cx = np.clip(np.floor((xs - xs.min()) / span_x * cells), 0, cells - 1).astype(np.int32)
+    cy = np.clip(np.floor((ys - ys.min()) / span_y * cells), 0, cells - 1).astype(np.int32)
+    bins = cy * cells + cx
+    acc = np.zeros((cells * cells, 4), np.float64)
+    hits = np.zeros(cells * cells, np.int32)
+    np.add.at(acc, bins, inliers)
+    np.add.at(hits, bins, 1)
+    keep = hits > 0
+    if int(keep.sum()) < 3:
+        return None
+    pts = acc[keep] / hits[keep, None]
+    n = len(pts)
+    lam = BASE_LAMBDA * (DEFAULT_WARP_GRID / cells) ** 2
+    dim = n + 3
+    k = np.zeros((dim, dim), np.float64)
+    diff = pts[:, None, 2:4] - pts[None, :, 2:4]
+    k[:n, :n] = _u(np.sum(diff * diff, axis=2))
+    k[np.arange(n), np.arange(n)] += lam
+    k[:n, n] = 1
+    k[:n, n + 1] = pts[:, 2]
+    k[:n, n + 2] = pts[:, 3]
+    k[n, :n] = 1
+    k[n + 1, :n] = pts[:, 2]
+    k[n + 2, :n] = pts[:, 3]
+    inv_x, inv_y = _apply_inv(sim, pts[:, 2], pts[:, 3])
+    bx = np.zeros(dim)
+    by = np.zeros(dim)
+    bx[:n] = pts[:, 0] - inv_x
+    by[:n] = pts[:, 1] - inv_y
+    try:
+        wx = np.linalg.solve(k, bx)
+        wy = np.linalg.solve(k, by)
+    except np.linalg.LinAlgError:
+        return None
+    return pts[:, 2], pts[:, 3], wx, wy
+
+
+def _maps(width, height, sim, tps):
+    """Source pixel coordinate for every destination pixel center."""
+    xs = np.arange(width, dtype=np.float64)
+    if tps is None:
+        grid_x, grid_y = np.meshgrid(xs, np.arange(height, dtype=np.float64))
+        mx, my = _apply_inv(sim, grid_x, grid_y)
+        return np.ascontiguousarray(mx, np.float32), np.ascontiguousarray(my, np.float32)
+
+    cx, cy, wx, wy = tps
+    n = len(cx)
+    map_x = np.empty((height, width), np.float32)
+    map_y = np.empty((height, width), np.float32)
+    for y0 in range(0, height, 24):
+        y1 = min(height, y0 + 24)
+        grid_x, grid_y = np.meshgrid(xs, np.arange(y0, y1, dtype=np.float64))
+        x = grid_x.reshape(-1)
+        y = grid_y.reshape(-1)
+        mx, my = _apply_inv(sim, x, y)
+        dx = x[:, None] - cx[None, :]
+        dy = y[:, None] - cy[None, :]
+        basis = _u(dx * dx + dy * dy)
+        ox = wx[n] + wx[n + 1] * x + wx[n + 2] * y + basis @ wx[:n]
+        oy = wy[n] + wy[n + 1] * x + wy[n + 2] * y + basis @ wy[:n]
+        map_x[y0:y1] = (mx + ox).reshape(y1 - y0, width).astype(np.float32)
+        map_y[y0:y1] = (my + oy).reshape(y1 - y0, width).astype(np.float32)
+    return map_x, map_y
+
+
+def _render(source_u8, width, height, sim, tps, cells):
+    del cells
+    map_x, map_y = _maps(width, height, sim, tps)
+    warped = cv2.remap(
+        source_u8,
+        map_x,
+        map_y,
+        cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    coverage = np.ones(source_u8.shape[:2], np.float32)
+    alpha = cv2.remap(
+        coverage,
+        map_x,
+        map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return warped.astype(np.float32) / 255.0, np.clip(alpha, 0.0, 1.0)
+
+
+def _srgb_to_lin(c):
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _lin_to_srgb(c):
+    c = np.clip(c, 0, 1)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * c ** (1 / 2.4) - 0.055)
+
+
+def _lab_f(t):
+    return np.where(t > 0.008856, np.cbrt(t), 7.787 * t + 16 / 116)
+
+
+def _lab_f_inv(t):
+    cube = t * t * t
+    return np.where(cube > 0.008856, cube, (t - 16 / 116) / 7.787)
+
+
+_TO_XYZ = np.array(
+    [
+        [0.4124, 0.3576, 0.1805],
+        [0.2126, 0.7152, 0.0722],
+        [0.0193, 0.1192, 0.9505],
+    ],
+    np.float64,
+)
+_FROM_XYZ = np.array(
+    [
+        [3.2406, -1.5372, -0.4986],
+        [-0.9689, 1.8758, 0.0415],
+        [0.0557, -0.204, 1.057],
+    ],
+    np.float64,
+)
+_WHITE = np.array([0.95047, 1.0, 1.08883], np.float64)
+
+
+def _rgb_to_lab(rgb):
+    lin = _srgb_to_lin(np.clip(rgb, 0, 1))
+    xyz = lin @ _TO_XYZ.T / _WHITE
+    f = _lab_f(xyz)
+    return np.stack(
+        [116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])],
+        axis=-1,
+    )
+
+
+def _lab_to_rgb(lab):
+    fy = (lab[..., 0] + 16) / 116
+    xyz = np.stack(
+        [
+            0.95047 * _lab_f_inv(fy + lab[..., 1] / 500),
+            _lab_f_inv(fy),
+            1.08883 * _lab_f_inv(fy - lab[..., 2] / 200),
+        ],
+        axis=-1,
+    )
+    return _lin_to_srgb(xyz @ _FROM_XYZ.T)
+
+
+def _blur_grid(grid, weight):
+    n = grid.shape[0]
+    out = np.zeros_like(grid)
+    for y in range(n):
+        for x in range(n):
+            total = 0.0
+            w = 0.0
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    gx, gy = x + dx, y + dy
+                    if gx < 0 or gy < 0 or gx >= n or gy >= n:
+                        continue
+                    kw = weight[gy, gx] / (1 + dx * dx + dy * dy)
+                    total += grid[gy, gx] * kw
+                    w += kw
+            out[y, x] = total / w if w > 0 else 0
+    return out
+
+
+def _harmonize(rgb, alpha, dest_u8, strength):
+    covered = alpha >= 0.98
+    if int(covered.sum()) < 64:
+        return rgb
+    lab_a = _rgb_to_lab(rgb)
+    lab_b = _rgb_to_lab(dest_u8.astype(np.float32) / 255.0)
+    step = max(1, int(round(math.sqrt(rgb.shape[0] * rgb.shape[1] / 400_000))))
+    sample = covered[::step, ::step]
+    a_s = lab_a[::step, ::step][sample]
+    b_s = lab_b[::step, ::step][sample]
+    if len(a_s) < 64:
+        return rgb
+    mean_a = a_s.mean(axis=0)
+    mean_b = b_s.mean(axis=0)
+    std_a = np.maximum(a_s.std(axis=0), 1e-3)
+    std_b = np.maximum(b_s.std(axis=0), 1e-3)
+    gain = np.clip(std_b / std_a, 1 / 3, 3)
+
+    g = 24
+    cell_sum = np.zeros((g, g), np.float64)
+    cell_w = np.zeros((g, g), np.float64)
+    ys, xs = np.mgrid[0:rgb.shape[0]:step, 0:rgb.shape[1]:step]
+    gy = np.clip((ys / rgb.shape[0] * g).astype(np.int32), 0, g - 1)
+    gx = np.clip((xs / rgb.shape[1] * g).astype(np.int32), 0, g - 1)
+    transferred_l = (lab_a[::step, ::step, 0] - mean_a[0]) * gain[0] + mean_b[0]
+    delta = lab_b[::step, ::step, 0] - transferred_l
+    mask = covered[::step, ::step]
+    np.add.at(cell_sum, (gy[mask], gx[mask]), delta[mask])
+    np.add.at(cell_w, (gy[mask], gx[mask]), 1)
+    nz = cell_w > 0
+    cell_sum[nz] /= cell_w[nz]
+    light = _blur_grid(_blur_grid(cell_sum, cell_w), np.where(cell_w > 0, 1.0, 0.25))
+
+    h, w = rgb.shape[:2]
+    fy = np.clip((np.arange(h) / h) * g - 0.5, 0, g - 1.001)
+    fx = np.clip((np.arange(w) / w) * g - 0.5, 0, g - 1.001)
+    y0 = np.floor(fy).astype(np.int32)
+    x0 = np.floor(fx).astype(np.int32)
+    ty = fy - y0
+    tx = fx - x0
+    light_map = (
+        (light[y0][:, x0] * (1 - tx)) * (1 - ty)[:, None]
+        + (light[y0][:, x0 + 1] * tx) * (1 - ty)[:, None]
+        + (light[y0 + 1][:, x0] * (1 - tx)) * ty[:, None]
+        + (light[y0 + 1][:, x0 + 1] * tx) * ty[:, None]
+    )
+    target = (lab_a - mean_a) * gain + mean_b
+    target[..., 0] += light_map
+    mixed = lab_a + (target - lab_a) * strength
+    out = _lab_to_rgb(mixed).astype(np.float32)
+    out[~covered] = rgb[~covered]
+    return np.clip(out, 0, 1)
+
+
+def _smoothstep(a, b, x):
+    t = np.clip((x - a) / (b - a), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def _difference_mask(rgb, alpha, dest_u8, sensitivity):
+    h, w = rgb.shape[:2]
+    scale = min(1.0, 1024 / max(h, w))
+    mw = max(8, int(round(w * scale)))
+    mh = max(8, int(round(h * scale)))
+    small_a = cv2.resize((rgb * 255).astype(np.uint8), (mw, mh), interpolation=cv2.INTER_AREA).astype(np.float32)
+    small_b = cv2.resize(dest_u8, (mw, mh), interpolation=cv2.INTER_AREA).astype(np.float32)
+    small_alpha = cv2.resize(alpha, (mw, mh), interpolation=cv2.INTER_AREA)
+    dr = small_a[..., 0] - small_b[..., 0]
+    dg = small_a[..., 1] - small_b[..., 1]
+    db = small_a[..., 2] - small_b[..., 2]
+    diff = np.sqrt(0.3 * dr * dr + 0.59 * dg * dg + 0.11 * db * db) / 255.0
+    diff[small_alpha < 8 / 255] = 0
+    radius = max(1, int(round(mw / 400)))
+    k = radius * 2 + 1
+    smooth = cv2.blur(cv2.blur(diff, (k, k)), (k, k))
+    thresh = 0.3 - 0.27 * min(1.0, max(0.0, sensitivity))
+    mask = _smoothstep(thresh * 0.7, thresh * 1.3, smooth).astype(np.float32)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 4 + 1, radius * 4 + 1))
+    mask = cv2.dilate(mask, kernel)
+    soft = radius * 4 + 1
+    mask = cv2.blur(cv2.blur(mask, (soft, soft)), (soft, soft))
+    return cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
