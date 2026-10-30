@@ -47,7 +47,7 @@ class AutoAligner:
                 }),
                 "features": (["High", "Fast", "Rigorous"], {
                     "default": "High",
-                    "tooltip": "High uses up to 16000 features at 3200px. Rigorous uses 32000 at 5120px, then fits the warp to the pixels. Fast uses 4000 at 1600px.",
+                    "tooltip": "High uses up to 16000 features at 3200px. Rigorous is the slow super-quality pass: up to 64000 features at 8192px, then a long fit against the pixels. Fast uses 4000 at 1600px.",
                 }),
                 "lock_aspect": ("BOOLEAN", {
                     "default": False,

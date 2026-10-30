@@ -16,7 +16,7 @@ To update, use Manager’s update button.
 
 The node is **Auto Aligner** under `image/align`.
 
-Inputs: resize, lock aspect, position, rotate, puppet warp, warp grid, colour match, auto mask, mask sensitivity, and features. Lock aspect is off by default. Features defaults to High. Rigorous uses up to 32000 features at 5120px, then fits the warp to the pixels. Fast is 4000 keypoints at 1600px.
+Inputs: resize, lock aspect, position, rotate, puppet warp, warp grid, colour match, auto mask, mask sensitivity, and features. Lock aspect is off by default. Features defaults to High. Rigorous is the slow super-quality pass: up to 64000 features at 8192px, a tighter match, then a long fit against the pixels. Fast is 4000 keypoints at 1600px.
 
 Outputs: `aligned` (IMAGE) and `mask` (MASK). Composite `aligned` over the destination with the mask.
 

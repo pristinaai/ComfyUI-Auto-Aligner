@@ -35,11 +35,15 @@ FUSED = {
     "iters": 10000,
 }
 RIGOROUS = {
-    "max_edge": 5120,
-    "max_keypoints": 32000,
-    "contrast": 0.008,
+    "max_edge": 8192,
+    "max_keypoints": 64000,
+    "contrast": 0.005,
     "fusion": True,
-    "iters": 12000,
+    "iters": 20000,
+    "octave_layers": 5,
+    "edge_threshold": 12,
+    "fusion_cap": 8000,
+    "tight": 0.35,
 }
 DEFAULT_WARP_GRID = 12
 BASE_LAMBDA = 1e3
@@ -54,7 +58,7 @@ def _gray(image):
 def _pyramid(gray):
     levels = [(gray, 1.0, 1.0)]
     current = gray
-    while min(current.shape[:2]) >= 240 and len(levels) < 5:
+    while min(current.shape[:2]) >= 64 and len(levels) < 8:
         nxt = cv2.pyrDown(current)
         parent = levels[-1]
         levels.append(
@@ -111,12 +115,12 @@ def _refine_photometric(source_u8, dest_u8, sim, options):
         angle = values["theta"]
         return (out_sx, out_sy, math.cos(angle), math.sin(angle), values["tx"], values["ty"])
 
-    def accumulate(level_s, level_d, values):
+    def accumulate(level_s, level_d, values, sample_target, huber):
         image_s, fx_s, fy_s = level_s
         image_d, fx_d, fy_d = level_d
         sh, sw = image_s.shape[:2]
         dh, dw = image_d.shape[:2]
-        step = max(1, int(math.sqrt((dh * dw) / 160_000)))
+        step = max(1, int(math.sqrt((dh * dw) / sample_target)))
         ys, xs = np.mgrid[2:dh - 2:step, 2:dw - 2:step]
         full_x = (xs + 0.5) / fx_d - 0.5
         full_y = (ys + 0.5) / fy_d - 0.5
@@ -136,18 +140,33 @@ def _refine_photometric(source_u8, dest_u8, sim, options):
         gy = np.zeros_like(image_s)
         gx[:, 1:-1] = (image_s[:, 2:] - image_s[:, :-2]) * 0.5
         gy[1:-1, :] = (image_s[2:, :] - image_s[:-2, :]) * 0.5
-        sampled = _sample_grid(image_s, lsx, lsy)[valid]
         grad_x = _sample_grid(gx, lsx, lsy)[valid] * fx_s
         grad_y = _sample_grid(gy, lsx, lsy)[valid] * fy_s
-        target = image_d[ys, xs][valid]
+        mag = np.hypot(grad_x, grad_y)
+        edge = mag >= 1.5
+        if int(edge.sum()) < 80:
+            return None
+        sampled = cv2.remap(
+            image_s,
+            lsx.astype(np.float32),
+            lsy.astype(np.float32),
+            cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )[valid][edge]
+        grad_x = grad_x[edge]
+        grad_y = grad_y[edge]
+        mag = mag[edge]
+        target = image_d[ys, xs][valid][edge]
         residual = sampled - target
-        src_x = src_x[valid]
-        src_y = src_y[valid]
-        rx = rx[valid]
-        ry = ry[valid]
-        weight = np.ones_like(residual)
-        heavy = np.abs(residual) > 12.0
-        weight[heavy] = 12.0 / np.abs(residual[heavy])
+        src_x = src_x[valid][edge]
+        src_y = src_y[valid][edge]
+        rx = rx[valid][edge]
+        ry = ry[valid][edge]
+        influence = mag / (mag + 8.0)
+        weight = influence.copy()
+        heavy = np.abs(residual) > huber
+        weight[heavy] = influence[heavy] * huber / np.abs(residual[heavy])
         sw = np.sqrt(weight)
         columns = []
         inv_sx = 1.0 / cur[0]
@@ -168,24 +187,30 @@ def _refine_photometric(source_u8, dest_u8, sim, options):
             columns.append(sw * (grad_x * dfull_x + grad_y * dfull_y))
         jac = np.stack(columns, axis=1)
         weighted_r = sw * residual
-        return jac.T @ jac, -(jac.T @ weighted_r), float(np.mean(weight * residual * residual)), int(valid.sum())
+        return jac.T @ jac, -(jac.T @ weighted_r), float(np.mean(weight * residual * residual)), int(edge.sum())
 
-    def cost_only(level_s, level_d, values):
-        found = accumulate(level_s, level_d, values)
+    def cost_only(level_s, level_d, values, sample_target, huber):
+        found = accumulate(level_s, level_d, values, sample_target, huber)
         if found is None:
             return None
         return found[2]
 
     for level in range(len(src_levels) - 1, -1, -1):
+        fine = level == 0
+        sample_target = 600_000 if fine else 200_000
+        huber = 8.0 if fine else 16.0
+        scale_frac = 0.02 if fine else 0.04
+        theta_cap = 0.012 if fine else 0.03
+        trans_limit = max(2.0, trans_cap * 0.25) if fine else trans_cap
         lam = 1e-3
-        for _ in range(8):
-            found = accumulate(src_levels[level], dst_levels[level], state)
+        for _ in range(14 if fine else 8):
+            found = accumulate(src_levels[level], dst_levels[level], state, sample_target, huber)
             if found is None:
                 break
             matrix, rhs, cost, _count = found
             diag = np.maximum(np.diag(matrix), 1e-8)
             improved = False
-            for _attempt in range(5):
+            for _attempt in range(6):
                 try:
                     step = np.linalg.solve(matrix + np.diag(lam * diag), rhs)
                 except np.linalg.LinAlgError:
@@ -195,18 +220,18 @@ def _refine_photometric(source_u8, dest_u8, sim, options):
                 for index, name in enumerate(free):
                     delta = float(step[index])
                     if name in ("sx", "sy", "s"):
-                        delta = min(max(delta, -0.04 * trial[name]), 0.04 * trial[name])
+                        delta = min(max(delta, -scale_frac * trial[name]), scale_frac * trial[name])
                     elif name == "theta":
-                        delta = min(max(delta, -0.03), 0.03)
+                        delta = min(max(delta, -theta_cap), theta_cap)
                     else:
-                        delta = min(max(delta, -trans_cap), trans_cap)
+                        delta = min(max(delta, -trans_limit), trans_limit)
                     trial[name] = trial[name] + delta
                     if name == "s":
                         trial["sx"] = trial["sy"] = trial["s"]
                 if trial["sx"] <= 1e-4 or trial["sy"] <= 1e-4:
                     lam *= 8
                     continue
-                trial_cost = cost_only(src_levels[level], dst_levels[level], trial)
+                trial_cost = cost_only(src_levels[level], dst_levels[level], trial, sample_target, huber)
                 if trial_cost is not None and trial_cost < cost:
                     state = trial
                     lam = max(lam * 0.3, 1e-6)
@@ -278,6 +303,7 @@ def _fit_pass(source_u8, dest_u8, options, budget):
         dest_u8.shape[1],
         dest_u8.shape[0],
         budget["iters"],
+        budget.get("tight", TIGHT_PX),
     )
     if fit is None:
         return None
@@ -285,13 +311,13 @@ def _fit_pass(source_u8, dest_u8, options, budget):
     return sim, inliers, (len(pts_a), len(pts_b), len(matches), len(inliers))
 
 
-def _detect(rgb, nfeatures, contrast):
+def _detect(rgb, nfeatures, contrast, octave_layers=3, edge_threshold=10):
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     sift = cv2.SIFT_create(
         nfeatures=int(nfeatures),
-        nOctaveLayers=3,
+        nOctaveLayers=int(octave_layers),
         contrastThreshold=float(contrast),
-        edgeThreshold=10,
+        edgeThreshold=float(edge_threshold),
         sigma=1.6,
     )
     keypoints, desc = sift.detectAndCompute(gray, None)
@@ -337,8 +363,10 @@ def _extract(rgb, budget):
     work_h = max(32, int(round(height * scale)))
     work = cv2.resize(rgb, (work_w, work_h), interpolation=cv2.INTER_AREA)
     limit = budget["max_keypoints"]
+    layers = int(budget.get("octave_layers", 3))
+    edge = float(budget.get("edge_threshold", 10))
     primary_n = int(limit * 0.88) if budget["fusion"] else limit
-    found = _detect(work, max(primary_n, 8), budget["contrast"])
+    found = _detect(work, max(primary_n, 8), budget["contrast"], layers, edge)
     if found is None:
         return None
     pts, desc, response = found
@@ -347,8 +375,8 @@ def _extract(rgb, budget):
         half_w = max(32, work_w // 2)
         half_h = max(32, work_h // 2)
         half = cv2.resize(work, (half_w, half_h), interpolation=cv2.INTER_AREA)
-        sec_n = max(256, min(2048, int(limit * 0.25)))
-        second = _detect(half, sec_n, budget["contrast"])
+        sec_n = max(256, min(int(budget.get("fusion_cap", 2048)), int(limit * 0.25)))
+        second = _detect(half, sec_n, budget["contrast"], layers, edge)
         if second is not None:
             pts2, desc2, response2 = second
             pts2 = _to_original(pts2, half_w, half_h, width, height)
@@ -525,7 +553,7 @@ def _inliers(pairs, sim, thresh):
     return src[keep], dst[keep]
 
 
-def _magsac(pairs, options, width_a, height_a, width_b, height_b):
+def _magsac(pairs, options, width_a, height_a, width_b, height_b, tight_px=TIGHT_PX):
     src = np.float32([(p[0], p[1]) for p in pairs])
     dst = np.float32([(p[2], p[3]) for p in pairs])
     thresh = THRESH_FRAC * math.hypot(width_b, height_b)
@@ -563,16 +591,18 @@ def _magsac(pairs, options, width_a, height_a, width_b, height_b):
     else:
         used_src = src[keep].astype(np.float64)
         used_dst = dst[keep].astype(np.float64)
-    sim, used_src, used_dst = _tighten(used_src, used_dst, sim, options, width_a, height_a, width_b, height_b)
+    sim, used_src, used_dst = _tighten(
+        used_src, used_dst, sim, options, width_a, height_a, width_b, height_b, tight_px
+    )
     return sim, np.concatenate([used_src, used_dst], axis=1)
 
 
-def _ransac(pairs, options, width_a, height_a, width_b, height_b, iterations):
+def _ransac(pairs, options, width_a, height_a, width_b, height_b, iterations, tight_px=TIGHT_PX):
     if len(pairs) < 2:
         return None
     aniso = options["resize"] and options["rotate"] and not options.get("lock_aspect")
     if options["resize"] and options["rotate"] and options["position"] and options.get("lock_aspect"):
-        fitted = _magsac(pairs, options, width_a, height_a, width_b, height_b)
+        fitted = _magsac(pairs, options, width_a, height_a, width_b, height_b, tight_px)
         if fitted is not None:
             return fitted
     thresh = THRESH_FRAC * math.hypot(width_b, height_b)
@@ -607,16 +637,23 @@ def _ransac(pairs, options, width_a, height_a, width_b, height_b, iterations):
             sim = final
             best_src, best_dst = refined_src, refined_dst
     sim, best_src, best_dst = _tighten(
-        best_src, best_dst, sim, options, width_a, height_a, width_b, height_b
+        best_src, best_dst, sim, options, width_a, height_a, width_b, height_b, tight_px
     )
     packed = np.concatenate([best_src, best_dst], axis=1).astype(np.float64)
     return sim, packed
 
 
-def _tighten(src, dst, sim, options, width_a, height_a, width_b, height_b):
-    """Refit on matches that already agree to about one pixel."""
+def _tighten(src, dst, sim, options, width_a, height_a, width_b, height_b, tight_px=TIGHT_PX):
+    """Refit on the closest matches. A second, tighter pass runs for rigorous."""
+    sim, src, dst = _tighten_once(src, dst, sim, options, width_a, height_a, width_b, height_b, TIGHT_PX)
+    if tight_px < TIGHT_PX:
+        sim, src, dst = _tighten_once(src, dst, sim, options, width_a, height_a, width_b, height_b, tight_px)
+    return sim, src, dst
+
+
+def _tighten_once(src, dst, sim, options, width_a, height_a, width_b, height_b, tight_px):
     mx, my = _apply(sim, src[:, 0], src[:, 1])
-    keep = (mx - dst[:, 0]) ** 2 + (my - dst[:, 1]) ** 2 <= TIGHT_PX * TIGHT_PX
+    keep = (mx - dst[:, 0]) ** 2 + (my - dst[:, 1]) ** 2 <= tight_px * tight_px
     if int(keep.sum()) < MIN_INLIERS:
         return sim, src, dst
     final = _fit_similarity(src[keep], dst[keep], options, width_a, height_a, width_b, height_b)
