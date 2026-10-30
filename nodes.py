@@ -45,9 +45,9 @@ class AutoAligner:
                     "step": 1,
                     "tooltip": "Higher keeps smaller differences in the auto mask.",
                 }),
-                "features": (["High", "Fast"], {
+                "features": (["High", "Fast", "Rigorous"], {
                     "default": "High",
-                    "tooltip": "High uses up to 16000 features at 3200px with exact matching. Fast uses 4000 at 1600px.",
+                    "tooltip": "High uses up to 16000 features at 3200px. Rigorous uses 32000 at 5120px, then fits the warp to the pixels. Fast uses 4000 at 1600px.",
                 }),
                 "lock_aspect": ("BOOLEAN", {
                     "default": False,
@@ -95,7 +95,7 @@ class AutoAligner:
             "harmonize": HARMONIZE.get(colour_match, 0.0),
             "auto_mask": bool(auto_mask),
             "mask_sensitivity": int(mask_sensitivity) / 100.0,
-            "features": "high" if features == "High" else "fast",
+            "features": {"High": "high", "Fast": "fast", "Rigorous": "rigorous"}[features],
         }
 
         images = []

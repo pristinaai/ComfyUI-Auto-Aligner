@@ -34,14 +34,200 @@ FUSED = {
     "fusion": True,
     "iters": 10000,
 }
+RIGOROUS = {
+    "max_edge": 5120,
+    "max_keypoints": 32000,
+    "contrast": 0.008,
+    "fusion": True,
+    "iters": 12000,
+}
 DEFAULT_WARP_GRID = 12
 BASE_LAMBDA = 1e3
+
+
+def _gray(image):
+    if image.ndim == 2:
+        return image.astype(np.float32)
+    return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+
+def _pyramid(gray):
+    levels = [(gray, 1.0, 1.0)]
+    current = gray
+    while min(current.shape[:2]) >= 240 and len(levels) < 5:
+        nxt = cv2.pyrDown(current)
+        parent = levels[-1]
+        levels.append(
+            (
+                nxt,
+                parent[1] * (nxt.shape[1] / current.shape[1]),
+                parent[2] * (nxt.shape[0] / current.shape[0]),
+            )
+        )
+        current = nxt
+    return levels
+
+
+def _sample_grid(image, xs, ys):
+    return cv2.remap(
+        image,
+        xs.astype(np.float32),
+        ys.astype(np.float32),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def _refine_photometric(source_u8, dest_u8, sim, options):
+    """Gauss-Newton fit of the warp to pixel values. Keeps the feature fit if this does not improve."""
+    free = []
+    if options["resize"]:
+        free.append("s" if options.get("lock_aspect") else "sx")
+        if not options.get("lock_aspect"):
+            free.append("sy")
+    if options["rotate"]:
+        free.append("theta")
+    if options["position"]:
+        free.extend(("tx", "ty"))
+    if not free:
+        return sim
+
+    src_levels = _pyramid(_gray(source_u8))
+    dst_levels = _pyramid(_gray(dest_u8))
+    sx, sy, c, si, tx, ty = [float(v) for v in sim]
+    theta = math.atan2(si, c)
+    if options["resize"] and options.get("lock_aspect"):
+        scale = math.sqrt(max(sx, 1e-6) * max(sy, 1e-6))
+        sx = sy = scale
+    state = {"sx": sx, "sy": sy, "s": math.sqrt(max(sx, 1e-6) * max(sy, 1e-6)), "theta": theta, "tx": tx, "ty": ty}
+    full_w = dest_u8.shape[1]
+    full_h = dest_u8.shape[0]
+    trans_cap = max(4.0, 0.02 * math.hypot(full_w, full_h))
+
+    def pack(values):
+        out_sx = values["s"] if "s" in free else values["sx"]
+        out_sy = values["s"] if "s" in free else values["sy"]
+        angle = values["theta"]
+        return (out_sx, out_sy, math.cos(angle), math.sin(angle), values["tx"], values["ty"])
+
+    def accumulate(level_s, level_d, values):
+        image_s, fx_s, fy_s = level_s
+        image_d, fx_d, fy_d = level_d
+        sh, sw = image_s.shape[:2]
+        dh, dw = image_d.shape[:2]
+        step = max(1, int(math.sqrt((dh * dw) / 160_000)))
+        ys, xs = np.mgrid[2:dh - 2:step, 2:dw - 2:step]
+        full_x = (xs + 0.5) / fx_d - 0.5
+        full_y = (ys + 0.5) / fy_d - 0.5
+        cur = pack(values)
+        dx = full_x - cur[4]
+        dy = full_y - cur[5]
+        rx = cur[2] * dx + cur[3] * dy
+        ry = -cur[3] * dx + cur[2] * dy
+        src_x = rx / cur[0]
+        src_y = ry / cur[1]
+        lsx = (src_x + 0.5) * fx_s - 0.5
+        lsy = (src_y + 0.5) * fy_s - 0.5
+        valid = (lsx > 1) & (lsy > 1) & (lsx < sw - 2) & (lsy < sh - 2)
+        if int(valid.sum()) < 80:
+            return None
+        gx = np.zeros_like(image_s)
+        gy = np.zeros_like(image_s)
+        gx[:, 1:-1] = (image_s[:, 2:] - image_s[:, :-2]) * 0.5
+        gy[1:-1, :] = (image_s[2:, :] - image_s[:-2, :]) * 0.5
+        sampled = _sample_grid(image_s, lsx, lsy)[valid]
+        grad_x = _sample_grid(gx, lsx, lsy)[valid] * fx_s
+        grad_y = _sample_grid(gy, lsx, lsy)[valid] * fy_s
+        target = image_d[ys, xs][valid]
+        residual = sampled - target
+        src_x = src_x[valid]
+        src_y = src_y[valid]
+        rx = rx[valid]
+        ry = ry[valid]
+        weight = np.ones_like(residual)
+        heavy = np.abs(residual) > 12.0
+        weight[heavy] = 12.0 / np.abs(residual[heavy])
+        sw = np.sqrt(weight)
+        columns = []
+        inv_sx = 1.0 / cur[0]
+        inv_sy = 1.0 / cur[1]
+        for name in free:
+            if name == "sx":
+                dfull_x, dfull_y = -src_x * inv_sx, np.zeros_like(src_x)
+            elif name == "sy":
+                dfull_x, dfull_y = np.zeros_like(src_y), -src_y * inv_sy
+            elif name == "s":
+                dfull_x, dfull_y = -src_x * inv_sx, -src_y * inv_sy
+            elif name == "theta":
+                dfull_x, dfull_y = ry * inv_sx, -rx * inv_sy
+            elif name == "tx":
+                dfull_x, dfull_y = np.full_like(src_x, -cur[2] * inv_sx), np.full_like(src_x, cur[3] * inv_sy)
+            else:
+                dfull_x, dfull_y = np.full_like(src_x, -cur[3] * inv_sx), np.full_like(src_x, -cur[2] * inv_sy)
+            columns.append(sw * (grad_x * dfull_x + grad_y * dfull_y))
+        jac = np.stack(columns, axis=1)
+        weighted_r = sw * residual
+        return jac.T @ jac, -(jac.T @ weighted_r), float(np.mean(weight * residual * residual)), int(valid.sum())
+
+    def cost_only(level_s, level_d, values):
+        found = accumulate(level_s, level_d, values)
+        if found is None:
+            return None
+        return found[2]
+
+    for level in range(len(src_levels) - 1, -1, -1):
+        lam = 1e-3
+        for _ in range(8):
+            found = accumulate(src_levels[level], dst_levels[level], state)
+            if found is None:
+                break
+            matrix, rhs, cost, _count = found
+            diag = np.maximum(np.diag(matrix), 1e-8)
+            improved = False
+            for _attempt in range(5):
+                try:
+                    step = np.linalg.solve(matrix + np.diag(lam * diag), rhs)
+                except np.linalg.LinAlgError:
+                    lam *= 8
+                    continue
+                trial = dict(state)
+                for index, name in enumerate(free):
+                    delta = float(step[index])
+                    if name in ("sx", "sy", "s"):
+                        delta = min(max(delta, -0.04 * trial[name]), 0.04 * trial[name])
+                    elif name == "theta":
+                        delta = min(max(delta, -0.03), 0.03)
+                    else:
+                        delta = min(max(delta, -trans_cap), trans_cap)
+                    trial[name] = trial[name] + delta
+                    if name == "s":
+                        trial["sx"] = trial["sy"] = trial["s"]
+                if trial["sx"] <= 1e-4 or trial["sy"] <= 1e-4:
+                    lam *= 8
+                    continue
+                trial_cost = cost_only(src_levels[level], dst_levels[level], trial)
+                if trial_cost is not None and trial_cost < cost:
+                    state = trial
+                    lam = max(lam * 0.3, 1e-6)
+                    improved = True
+                    break
+                lam *= 8
+            if not improved:
+                break
+    return pack(state)
 
 
 def align_pair(source_u8, dest_u8, options):
     """Return float RGB (H, W, 3) and alpha (H, W) at the destination size."""
     height, width = dest_u8.shape[:2]
-    order = (HIGH, FUSED, FAST) if options.get("features", "high") == "high" else (FAST, HIGH, FUSED)
+    mode = options.get("features", "high")
+    if mode == "rigorous":
+        order = (RIGOROUS, HIGH, FUSED)
+    elif mode == "fast":
+        order = (FAST, HIGH, FUSED)
+    else:
+        order = (HIGH, FUSED, FAST)
     pass_result = None
     for budget in order:
         pass_result = _fit_pass(source_u8, dest_u8, options, budget)
@@ -54,6 +240,8 @@ def align_pair(source_u8, dest_u8, options):
         raise RuntimeError("Too few inliers. Try images with more overlap.")
 
     sim, inliers, stats = pass_result
+    if mode == "rigorous":
+        sim = _refine_photometric(source_u8, dest_u8, sim, options)
     tps = None
     cells = 64
     if options["puppet_warp"]:
@@ -516,9 +704,26 @@ def _maps(width, height, sim, tps):
     return map_x, map_y
 
 
+def _prefilter_source(source_u8, sim):
+    """Blur before a shrink so the resample does not keep the original pixels."""
+    sx = max(float(sim[0]), 1e-6)
+    sy = max(float(sim[1]), 1e-6)
+    sigma_x = 0.5 * max(0.0, (1.0 / sx) - 1.0)
+    sigma_y = 0.5 * max(0.0, (1.0 / sy) - 1.0)
+    if sigma_x < 0.2 and sigma_y < 0.2:
+        return source_u8
+    return cv2.GaussianBlur(
+        source_u8,
+        (0, 0),
+        sigmaX=max(sigma_x, 1e-3),
+        sigmaY=max(sigma_y, 1e-3),
+    )
+
+
 def _render(source_u8, width, height, sim, tps, cells):
     del cells
     map_x, map_y = _maps(width, height, sim, tps)
+    source_u8 = _prefilter_source(source_u8, sim)
     warped = cv2.remap(
         source_u8,
         map_x,
