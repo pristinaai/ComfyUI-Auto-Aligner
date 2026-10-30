@@ -208,28 +208,20 @@ def _match(pts_a, desc_a, pts_b, desc_b):
 
 
 def _apply(sim, x, y):
-    s, c, si, tx, ty = sim
-    return s * (c * x - si * y) + tx, s * (si * x + c * y) + ty
-
-
-def _invert(sim):
-    s, c, si, tx, ty = sim
-    inv_s = 1.0 / (s or 1.0)
-    nsi = -si
-    return (
-        inv_s,
-        c,
-        nsi,
-        -inv_s * (c * tx - nsi * ty),
-        -inv_s * (nsi * tx + c * ty),
-    )
+    sx, sy, c, si, tx, ty = sim
+    return c * sx * x - si * sy * y + tx, si * sx * x + c * sy * y + ty
 
 
 def _apply_inv(sim, x, y):
-    return _apply(_invert(sim), x, y)
+    sx, sy, c, si, tx, ty = sim
+    dx = x - tx
+    dy = y - ty
+    rx = c * dx + si * dy
+    ry = -si * dx + c * dy
+    return rx / sx, ry / sy
 
 
-def _fit_similarity(src, dst, options, width_a, height_a, width_b, height_b):
+def _fit_uniform(src, dst, options, width_a, height_a, width_b, height_b):
     count = len(src)
     if count <= 0:
         return None
@@ -269,10 +261,72 @@ def _fit_similarity(src, dst, options, width_a, height_a, width_b, height_b):
         cx_b, cy_b = width_b * 0.5, height_b * 0.5
         tx = cx_b - scale * (c * cx_a - si * cy_a)
         ty = cy_b - scale * (si * cx_a + c * cy_a)
-    sim = (scale, c, si, float(tx), float(ty))
+    sim = (scale, scale, c, si, float(tx), float(ty))
     if not all(math.isfinite(v) for v in sim):
         return None
     return sim
+
+
+def _fit_aniso(src, dst, options, width_a, height_a, width_b, height_b):
+    """Independent x and y scale, one rotation, no shear."""
+    if len(src) <= 0:
+        return None
+    if options["position"]:
+        a0 = src.mean(axis=0)
+        b0 = dst.mean(axis=0)
+    else:
+        a0 = np.array([width_a * 0.5, height_a * 0.5])
+        b0 = np.array([width_b * 0.5, height_b * 0.5])
+    a = src - a0
+    b = dst - b0
+    sxx = float(np.sum(b[:, 0] * a[:, 0]))
+    sxy = float(np.sum(b[:, 0] * a[:, 1]))
+    syx = float(np.sum(b[:, 1] * a[:, 0]))
+    syy = float(np.sum(b[:, 1] * a[:, 1]))
+    c, si = 1.0, 0.0
+    if options["rotate"]:
+        angle = math.atan2(syx - sxy, sxx + syy)
+        c, si = math.cos(angle), math.sin(angle)
+    sx, sy = 1.0, 1.0
+    x = a[:, 0]
+    y = a[:, 1]
+    u = b[:, 0]
+    v = b[:, 1]
+    for _ in range(8):
+        xx = float(np.sum(x * x))
+        yy = float(np.sum(y * y))
+        if xx < 1e-12 or yy < 1e-12:
+            return None
+        sx = float(np.sum(x * (c * u + si * v)) / xx)
+        sy = float(np.sum(y * (-si * u + c * v)) / yy)
+        if not (math.isfinite(sx) and math.isfinite(sy)) or sx <= 1e-6 or sy <= 1e-6:
+            return None
+        if not options["rotate"]:
+            break
+        xs = sx * x
+        ys = sy * y
+        sxx = float(np.sum(u * xs))
+        sxy = float(np.sum(u * ys))
+        syx = float(np.sum(v * xs))
+        syy = float(np.sum(v * ys))
+        angle = math.atan2(syx - sxy, sxx + syy)
+        nc, nsi = math.cos(angle), math.sin(angle)
+        if abs(nc - c) + abs(nsi - si) < 1e-12:
+            c, si = nc, nsi
+            break
+        c, si = nc, nsi
+    tx = float(b0[0] - (c * sx * a0[0] - si * sy * a0[1]))
+    ty = float(b0[1] - (si * sx * a0[0] + c * sy * a0[1]))
+    sim = (sx, sy, c, si, tx, ty)
+    if not all(math.isfinite(v) for v in sim):
+        return None
+    return sim
+
+
+def _fit_similarity(src, dst, options, width_a, height_a, width_b, height_b):
+    if options["resize"] and not options.get("lock_aspect"):
+        return _fit_aniso(src, dst, options, width_a, height_a, width_b, height_b)
+    return _fit_uniform(src, dst, options, width_a, height_a, width_b, height_b)
 
 
 def _inliers(pairs, sim, thresh):
@@ -328,7 +382,8 @@ def _magsac(pairs, options, width_a, height_a, width_b, height_b):
 def _ransac(pairs, options, width_a, height_a, width_b, height_b, iterations):
     if len(pairs) < 2:
         return None
-    if options["resize"] and options["rotate"] and options["position"]:
+    aniso = options["resize"] and options["rotate"] and not options.get("lock_aspect")
+    if options["resize"] and options["rotate"] and options["position"] and options.get("lock_aspect"):
         fitted = _magsac(pairs, options, width_a, height_a, width_b, height_b)
         if fitted is not None:
             return fitted
@@ -338,14 +393,14 @@ def _ransac(pairs, options, width_a, height_a, width_b, height_b, iterations):
     best_src = None
     best_dst = None
     n = len(pairs)
+    need = 3 if aniso else 2
+    if n < need:
+        return None
     for _ in range(iterations):
-        i0 = int(rng.integers(0, n))
-        i1 = int(rng.integers(0, n - 1))
-        if i1 >= i0:
-            i1 += 1
-        sample = [pairs[i0], pairs[i1]]
-        src = np.array([[sample[0][0], sample[0][1]], [sample[1][0], sample[1][1]]], np.float64)
-        dst = np.array([[sample[0][2], sample[0][3]], [sample[1][2], sample[1][3]]], np.float64)
+        pick = rng.choice(n, size=need, replace=False)
+        sample = [pairs[int(i)] for i in pick]
+        src = np.array([[p[0], p[1]] for p in sample], np.float64)
+        dst = np.array([[p[2], p[3]] for p in sample], np.float64)
         model = _fit_similarity(src, dst, options, width_a, height_a, width_b, height_b)
         if model is None:
             continue

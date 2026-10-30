@@ -49,6 +49,10 @@ class AutoAligner:
                     "default": "High",
                     "tooltip": "High uses up to 16000 features at 3200px with exact matching. Fast uses 4000 at 1600px.",
                 }),
+                "lock_aspect": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use one scale for width and height. Off lets them scale separately.",
+                }),
             }
         }
 
@@ -71,6 +75,7 @@ class AutoAligner:
         auto_mask,
         mask_sensitivity,
         features,
+        lock_aspect,
     ):
         src = _as_batch(source)
         dst = _as_batch(destination)
@@ -82,6 +87,7 @@ class AutoAligner:
 
         options = {
             "resize": bool(resize),
+            "lock_aspect": bool(lock_aspect),
             "position": bool(position),
             "rotate": bool(rotate),
             "puppet_warp": bool(puppet_warp),
